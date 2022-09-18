@@ -1,0 +1,169 @@
+library(ggplot2)
+library(DESeq2)
+library(pheatmap)
+library(GEOquery)
+library(apeglm)
+library(dplyr)
+library(annotables)
+library(tidyverse)
+library(writexl)
+library(pcaExplorer)
+
+# contains a data frame of the information for each sample
+sample_metadata  <- read.csv("GSE193369_sample_metadata.csv.gz", stringsAsFactors =  F, row.names = 1)
+
+# a data frame of columns (samples) and rows (genes)
+BSVTK_counts <- read.table("GSE193369_BSVTK_unfiltered_counts.txt.gz")
+
+# visualization of one of the samples showing that counts need transformation (right skew)
+ggplot(BSVTK_counts)+
+  geom_histogram(aes(x = M1_Liver_C2), bins = 200)
+
+# the large vector comes after the(%>%) operator
+all(colnames(BSVTK_counts) %in% rownames(sample_metadata))
+
+# shows if we need to re-assort the data of remove data that are not in common
+# as in this case data are sorted but some should be removed (NA)
+match(rownames(sample_metadata), colnames(BSVTK_counts))
+
+# taking needed data for analysis
+sample_metadata <- sample_metadata[1:24, ]
+
+# selecting needed columns from the data frame in order to decrease size of the data
+sample_metadata <- sample_metadata %>%
+  select(organ, clone)
+
+rownames(sample_metadata)
+colnames(BSVTK_counts)
+
+# checking if the names are in the same order
+all(colnames(BSVTK_counts) == rownames(sample_metadata))
+
+glimpse(sample_metadata)
+
+# convert to organ column to factor in order to avoid any errors when modeling the formula
+sample_metadata <- sample_metadata %>%
+  mutate(organ = as.factor(sample_metadata$organ))
+
+glimpse(sample_metadata)
+
+# creating a DESeqDataSet size = 9.4 MB
+dds = DESeqDataSetFromMatrix(countData = BSVTK_counts,
+                             colData = sample_metadata,
+                             design = ~ organ)
+
+dds
+
+# Prefiltering will remove the genes that are barely expressed
+keep <- rowSums(counts(dds)) > 10
+keep
+
+# keeping the rows which have a sum greater than 10, dds size = 6.8MB
+dds <- dds[keep, ]
+dds
+
+"WHEN DEFINING THE REFERENCE LEVEL
+if you never tell the DESeq2 functions which level you want to compare
+against, the comparisons will be based on the alphabetical order of the levels,
+so I defined the tumor to be the control level, since it was the original site
+of cancer(in the breat)"
+
+dds$organ <- relevel(dds$organ, ref = "Tumor")
+
+## QC : Normalization
+dds_sizefactors <- estimateSizeFactors(dds)
+sizeFactors(dds_sizefactors)
+
+normalized_counts <- counts(dds_sizefactors, normalize = T)
+
+## QC : Unsupervised clustering
+# rlog instead of vsd
+
+"vst is used for >20 samples, while rlog is for < 20 samples
+both perform the same function but with different pace"
+
+vsd <- vst(dds, blind = T)
+
+# Extarct vst matrix from the object
+vsd_matrix <- assay(vsd)
+
+# pairwise correlation values
+vsd_cor <- cor(vsd_matrix)
+
+# create a heatmap
+pheatmap(vsd_cor, annotation = select(sample_metadata, organ))
+
+# Principal Component Factor
+plotPCA(vsd, intgroup = "clone")
+"by default, plots top 500 genes"
+
+pcaplot(vsd, intgroup = "organ", text_labels = F,
+        pcX =3, pcY = 4, ellipse = F, ntop = 500)
+" samples cluster and separate on PCA 3 "
+# Perform Differential Expression Analysis
+dds <- DESeq(dds)
+
+# plot dispersion estimates
+plotDispEsts(dds)
+
+# access the results
+result0.05 <- results(dds, alpha = 0.05)
+result0.05
+
+#log2 fold change-> log2(lung/tumor)
+
+resultsNames(dds)
+
+"For resultsNames: the names of the columns available as results, usually a
+combination of the variable name and a level"
+
+resLFC_Liver <- lfcShrink(dds, coef = "organ_Liver_vs_Tumor", type = "apeglm")
+head(resLFC_Liver)
+
+resLFC_Lung <- lfcShrink(dds, coef = "organ_Lung_vs_Tumor", type = "apeglm")
+head(resLFC_Lung)
+
+# p-value & padj
+
+summary_Liver <- summary(resLFC_Liver, alpha = 0.05)
+
+summary_Lung <- summary(resLFC_Lung, alpha = 0.05)
+
+# MAplot
+plotMA(dds)
+plotMA(resLFC_Liver, ylim= c(-2, 2), alpha = 0.05, main = "Liver")
+plotMA(resLFC_Lung, ylim = c(-2, 2), alpha = 0.05, main = "Lung")
+
+# convert to data frames
+resLFC_Liver <- as.data.frame(resLFC_Liver)
+head(resLFC_Liver)
+
+resLFC_Lung <- as.data.frame(resLFC_Lung)
+head(resLFC_Lung)
+
+# filter by padj for 0.05
+Liver_DEG_0.05_padj <- resLFC_Liver %>%
+  filter(padj < 0.05)
+
+Lung_DEG_0.05_padj <- resLFC_Lung %>%
+  filter(padj < 0.05)
+
+# Annotate
+grch38_editted <- grch38 %>%
+  select(ensgene, entrez,symbol,biotype, description )
+
+# create an excel sheet for DEG in the Lung
+Lung_DEG_0.05_padj <- rownames_to_column(Lung_DEG_0.05_padj, var = "ensgene")
+
+Lung_DEG_0.05_padj_annotated <- grch38_editted %>%
+   inner_join(Lung_DEG_0.05_padj, by = "ensgene" )
+ 
+write_xlsx(x= Lung_DEG_0.05_padj_annotated, "Lung_DEG.xlsx", col_names = T)
+
+# create an excel sheet for DEG in the Liver
+Liver_DEG_0.05_padj <- rownames_to_column(Liver_DEG_0.05_padj, var = "ensgene")
+
+Liver_DEG_0.05_padj_annotated <- grch38_editted %>%
+  inner_join(Liver_DEG_0.05_padj, by = "ensgene" )
+
+write_xlsx(x= Liver_DEG_0.05_padj_annotated, "Liver_DEG.xlsx", col_names = T)
